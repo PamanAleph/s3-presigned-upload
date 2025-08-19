@@ -3,7 +3,7 @@ name: CI/CD Pipeline
 on:
   push:
     branches: [master]
-    tags-ignore: ['**']
+    tags-ignore: ['**']   # hindari trigger dari tag push
   pull_request:
     branches: [master]
 
@@ -11,145 +11,170 @@ env:
   CI: true
 
 jobs:
-  # Testing and Quality Assurance Jobs
+  # ============================================================
+  # TEST MATRIX
+  # ============================================================
   test:
     name: Test (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
-    
     strategy:
       matrix:
         node-version: [18, 20, 22]
-        
+
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
-        
-      - name: Setup Node.js ${{ matrix.node-version }}
+
+      - name: Setup Node ${{ matrix.node-version }}
         uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
-          cache: 'npm'
-          
-      - name: Install dependencies
+          cache: npm
+
+      - name: Install deps
         run: npm ci
-        
-      - name: Lint code
+
+      - name: Lint
         run: npm run lint
-        
+
       - name: Type check
         run: npm run type-check
-        
-      - name: Build package
+
+      - name: Build
         run: npm run build
-        
-      - name: Run tests
+
+      - name: Tests
         run: npm run test:run
-        
-      - name: Upload coverage to Codecov
-        if: matrix.node-version == 20
-        uses: codecov/codecov-action@v3
-        with:
-          file: ./coverage/lcov.info
-          fail_ci_if_error: false
-          
+
+      # Opsional: upload coverage (hapus jika tak dipakai)
+      # - name: Upload coverage to Codecov
+      #   if: matrix.node-version == 20
+      #   uses: codecov/codecov-action@v4
+      #   with:
+      #     files: ./coverage/lcov.info
+      #     fail_ci_if_error: false
+
+  # ============================================================
+  # BUILD VERIFICATION
+  # ============================================================
   build-check:
     name: Build Verification
     runs-on: ubuntu-latest
     needs: test
-    
+
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
-        
-      - name: Setup Node.js
+
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm'
-          
-      - name: Install dependencies
+          cache: npm
+
+      - name: Install deps
         run: npm ci
-        
-      - name: Build package
+
+      - name: Build
         run: npm run build
-        
+
       - name: Check build output
         run: |
           ls -la dist/
           test -f dist/index.js
           test -f dist/index.d.ts
-          
-      - name: Test package exports
+
+      - name: Test package exports (ESM)
         run: |
-          node -e "const pkg = require('./dist/index.js'); console.log('Exports:', Object.keys(pkg));"
-          
+          node -e "import('./dist/index.js').then(m=>console.log('Exports ESM OK')).catch(e=>{console.error(e);process.exit(1)})"
+
+  # ============================================================
+  # LINT / FORMAT
+  # ============================================================
   lint-and-format:
     name: Code Quality Check
     runs-on: ubuntu-latest
-    
+
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
-        
-      - name: Setup Node.js
+
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm'
-          
-      - name: Install dependencies
+          cache: npm
+
+      - name: Install deps
         run: npm ci
-        
-      - name: Check ESLint
+
+      - name: ESLint
         run: npm run lint
-        
-      - name: Check Prettier formatting
+
+      - name: Prettier check
         run: npm run format:check
-        
-      - name: TypeScript type check
+
+      - name: Type check
         run: npm run type-check
 
-  # Release and Publishing Job
+  # ============================================================
+  # RELEASE (Mode B: commit balik CHANGELOG & package.json)
+  # ============================================================
   release:
     name: Release & Publish
     runs-on: ubuntu-latest
     needs: [test, build-check, lint-and-format]
-    
+
+    # Hindari double-run & izinkan provenance
     permissions:
       contents: write
       id-token: write
       packages: write
-    
-    # Only run on push to master branch and not from release bot
+
+    # Hanya jalan saat push ke master dan bukan commit release sebelumnya
     if: github.event_name == 'push' && github.ref == 'refs/heads/master' && !contains(github.event.head_commit.message, 'chore(release)')
-    
+
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+
     steps:
-      - name: Checkout code
+      - name: Checkout (with PAT for push to protected branch)
         uses: actions/checkout@v4
         with:
-          # Fetch full history for conventional commits
           fetch-depth: 0
-          # Use a token that can trigger workflows
-          token: ${{ secrets.GITHUB_TOKEN }}
-          
-      - name: Setup Node.js
+          token: ${{ secrets.RELEASE_PAT }}   # Fine-grained PAT
+
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm'
+          cache: npm
           registry-url: 'https://registry.npmjs.org'
-          
-      - name: Install dependencies
+
+      - name: Install deps
         run: npm ci
-        
-      - name: Run final tests
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+
+      - name: Final tests
         run: npm run test:run
-        
-      - name: Build package
+
+      - name: Build
         run: npm run build
-        
+
+      - name: NPM auth sanity (optional)
+        run: npm whoami || true
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
       - name: Semantic Release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # pakai PAT agar boleh commit & push ke branch yang diproteksi
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PAT }}
+          # untuk publish ke npm (provenance aktif di publishConfig)
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npx semantic-release
